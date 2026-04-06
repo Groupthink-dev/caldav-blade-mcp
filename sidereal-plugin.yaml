@@ -21,6 +21,43 @@ services:
     update: cal_update
     delete: cal_delete
 
+setup:
+  icon: "\U0001F4C5"
+  blurb: "Protocol-level CalDAV access — read events, search, check availability, and manage calendars on any CalDAV server."
+  auth_model: basic
+  complexity: trivial
+  fields:
+    - key: CALDAV_URL
+      label: "CalDAV URL"
+      secret: false
+      required: true
+      placeholder: "https://caldav.fastmail.com/dav/calendars"
+      help: "CalDAV server endpoint (Fastmail, iCloud, Google, Nextcloud, etc.)"
+    - key: CALDAV_USERNAME
+      label: "Username"
+      secret: false
+      required: true
+      placeholder: "user@example.com"
+    - key: CALDAV_PASSWORD
+      label: "Password"
+      secret: true
+      required: true
+      help: "App-specific password recommended for providers that support it"
+    - key: CALDAV_WRITE_ENABLED
+      label: "Enable write operations"
+      type: boolean
+      secret: false
+      required: false
+      help: "Create, update, and delete calendar events"
+  test:
+    endpoint: "{CALDAV_URL}"
+    auth_style: basic
+  help:
+    - label: "CalDAV protocol spec"
+      url: "https://www.rfc-editor.org/rfc/rfc4791"
+    - label: "Fastmail CalDAV setup"
+      url: "https://www.fastmail.help/hc/en-us/articles/1500000278342"
+
 install:
   runtime: uv
   package: caldav-blade-mcp
