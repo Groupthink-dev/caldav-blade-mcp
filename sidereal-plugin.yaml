@@ -4,6 +4,8 @@ description: "CalDAV calendar operations — protocol-level access to any CalDAV
 author: piersdd
 licence: MIT
 tier: certified
+author_type: first-party
+readiness: production
 homepage: https://github.com/piersdd/caldav-blade-mcp
 contract: calendar-v1
 
