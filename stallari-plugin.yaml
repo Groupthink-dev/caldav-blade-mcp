@@ -1,12 +1,12 @@
 name: caldav-blade-mcp
 version: "0.1.0"
 description: "CalDAV calendar operations — protocol-level access to any CalDAV server"
-author: piersdd
+author: groupthink-dev
 licence: MIT
 tier: certified
 author_type: first-party
 readiness: production
-homepage: https://github.com/piersdd/caldav-blade-mcp
+homepage: https://github.com/groupthink-dev/caldav-blade-mcp
 contract: calendar-v1
 
 services:
@@ -78,10 +78,11 @@ env:
     default: "false"
 
 requires:
-  sidereal: ">=0.3.0"
+  stallari: ">=0.60"
 
 conformance:
   required: "4/4"
   recommended: "3/3"
+  gated: "3/3"
   optional: "1/1"
-  last_tested: "2026-03-25"
+  last_tested: "2026-04-18"
