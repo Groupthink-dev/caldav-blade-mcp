@@ -1,6 +1,6 @@
 [project]
 name = "caldav-blade-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "CalDAV MCP Server — calendar events, scheduling, and availability"
 readme = "README.md"
 license = {text = "MIT"}

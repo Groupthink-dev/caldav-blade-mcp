@@ -1,5 +1,5 @@
 name: caldav-blade-mcp
-version: "0.1.0"
+version: "0.1.1"
 description: "CalDAV calendar operations — protocol-level access to any CalDAV server"
 author: groupthink-dev
 licence: MIT
