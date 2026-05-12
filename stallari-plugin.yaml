@@ -80,6 +80,8 @@ env:
 requires:
   stallari: ">=0.60"
 
+  adapter_contracts:
+    - "calendar >= 1.0"
 conformance:
   required: "4/4"
   recommended: "3/3"
