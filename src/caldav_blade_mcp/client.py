@@ -245,16 +245,38 @@ class CalDAVClient:
     # ------------------------------------------------------------------
 
     def list_calendars(self) -> list[dict[str, Any]]:
-        """Return all accessible calendars across all providers."""
-        result = []
-        for provider_name, cal in self._all_calendars():
-            result.append(
-                {
-                    "name": str(cal.name) if cal.name else None,
-                    "uid": str(cal.id),
-                    "provider": provider_name,
-                }
-            )
+        """Return all accessible calendars across all providers.
+
+        DD-338 B.2: partial-tolerant — a single failing provider no longer
+        kills the whole tool. Each provider is tried independently; failures
+        surface as in-band error rows (``{"provider": name, "error": msg}``)
+        alongside the standard calendar rows, mirroring the per-provider
+        try/except pattern already used by ``info()`` (see ``client.py``
+        :meth:`info`). This closes the latent gap where a slow iCloud would
+        previously block the Fastmail/Google listing.
+
+        The declaration in ``stallari-plugins/plugins/tools/caldav-blade-mcp.json``
+        is ``deterministic_ordering: unsorted`` per the architect-ratified
+        honest-degraded-declaration precedent (cf_d1_query); no internal sort
+        is applied — the assembler downstream is responsible for canonical
+        ordering with full provenance.
+        """
+        result: list[dict[str, Any]] = []
+        # DD-338 B.2: per-provider try/except (was "raise on first failure")
+        for provider_name, conn in self._providers.items():
+            try:
+                for cal in conn.calendars():
+                    result.append(
+                        {
+                            "name": str(cal.name) if cal.name else None,
+                            "uid": str(cal.id),
+                            "provider": provider_name,
+                        }
+                    )
+            except Exception as exc:
+                msg = _scrub_credentials(str(exc))
+                logger.warning("Failed to list calendars from provider %s: %s", provider_name, msg)
+                result.append({"provider": provider_name, "error": msg})
         return result
 
     def info(self) -> dict[str, Any]:
