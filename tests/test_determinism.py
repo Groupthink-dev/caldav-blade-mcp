@@ -588,13 +588,15 @@ class TestCalFreebusyMeta:
 
 
 # ---------------------------------------------------------------------------
-# Helper-shape direct test for _append_meta
+# Helper-shape direct test for canonical ``stallari_mcp_helpers`` envelope
+# (DD-338 Phase E.python — local ``_append_meta`` retired; the call-sites
+# now invoke ``append_meta`` + ``meta_envelope`` from the canonical lib.)
 # ---------------------------------------------------------------------------
 
 
 class TestAppendMetaHelper:
     def test_helper_appends_envelope(self) -> None:
-        from caldav_blade_mcp.formatters import _append_meta
+        from stallari_mcp_helpers import append_meta, meta_envelope
 
         meta = {
             "matched_total": 5,
@@ -603,16 +605,26 @@ class TestAppendMetaHelper:
             "latency_ms": 42,
         }
         body = "line1\nline2"
-        out = _append_meta(body, meta)
+        out = append_meta(body, meta_envelope(**meta))
         assert out.startswith("line1\nline2\n\n_meta: ")
         parsed = json.loads(out.split("_meta: ", 1)[1])
-        assert parsed == meta
+        # Canonical envelope always carries redactions=[] and next_cursor=null
+        # in addition to the caller-supplied fields.
+        assert parsed["matched_total"] == 5
+        assert parsed["returned"] == 3
+        assert parsed["filtered_by"] == ["scope=work"]
+        assert parsed["latency_ms"] == 42
+        assert parsed["redactions"] == []
+        assert parsed["next_cursor"] is None
 
     def test_helper_passthrough_when_meta_none(self) -> None:
-        from caldav_blade_mcp.formatters import _append_meta
+        # The blade's formatter contract: meta=None ⇒ body passes through
+        # unchanged. With the canonical lib that is enforced at the
+        # formatter call-site, not inside the helper.
+        from caldav_blade_mcp.formatters import format_event_list
 
-        body = "hello"
-        assert _append_meta(body, None) == body
+        body_out = format_event_list([], meta=None)
+        assert body_out == "(no events)"
 
 
 # ---------------------------------------------------------------------------

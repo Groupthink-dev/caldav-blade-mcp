@@ -9,44 +9,21 @@ All formatters return compact strings optimised for LLM consumption:
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from dateutil.parser import isoparse
+from stallari_mcp_helpers import append_meta, meta_envelope
 
 # ---------------------------------------------------------------------------
 # DD-338 Phase C Wave 2 — _meta envelope (JSON-tail block)
 # ---------------------------------------------------------------------------
 #
-# Canonical wire shape (architect amendment 2026-05-21, mastodon A.1 precedent):
+# Canonical wire shape (DD-338 Phase E.python — substrate moved to
+# ``stallari_mcp_helpers``). Build the envelope line via ``meta_envelope(**meta)``
+# and join with ``append_meta(body, line)``.
 #
-#     <existing payload>
-#
-#     _meta: {"matched_total": N, "returned": M, "filtered_by": [...], ...}
-#
-# Single JSON line, appended after \n\n. Assembler regex:
-#     \n\n_meta: (\{.*\})$
-#
-# Required fields: matched_total, returned, filtered_by, latency_ms.
-# Optional: redactions, next_cursor, error_notes.
-
-
-def _append_meta(body: str, meta: dict[str, Any] | None) -> str:
-    """Append a DD-338 _meta envelope as a JSON-tail block.
-
-    Regex contract (assembler-side): ``\\n\\n_meta: (\\{.*\\})$``
-    Required fields: ``matched_total``, ``returned``, ``filtered_by``,
-    ``latency_ms``. Optional: ``redactions``, ``next_cursor``, ``error_notes``.
-
-    Returns ``body`` unchanged when ``meta`` is ``None`` (back-compat for
-    write-tool formatters that don't emit an envelope).
-    """
-    if meta is None:
-        return body
-    envelope = "_meta: " + json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
-    if not body:
-        return envelope
-    return f"{body}\n\n{envelope}"
+# Required fields in ``meta``: matched_total, returned, filtered_by,
+# latency_ms. Optional: redactions, next_cursor, error_notes, domain_hints.
 
 
 def _format_time(iso_str: str | None, all_day: bool = False) -> str:
@@ -107,11 +84,12 @@ def format_event_list(
     JSON-tail envelope per the structured audit-surface contract.
     """
     if not events:
-        return _append_meta("(no events)", meta)
+        body = "(no events)"
+        return append_meta(body, meta_envelope(**meta)) if meta else body
     # Sort by start time
     events = sorted(events, key=lambda e: e.get("start") or "")
     body = "\n".join(format_event_line(e) for e in events)
-    return _append_meta(body, meta)
+    return append_meta(body, meta_envelope(**meta)) if meta else body
 
 
 def format_events_grouped(
@@ -124,7 +102,8 @@ def format_events_grouped(
     DD-338 Phase C Wave 2 — appends an optional ``_meta`` envelope.
     """
     if not grouped:
-        return _append_meta("(no events)", meta)
+        body = "(no events)"
+        return append_meta(body, meta_envelope(**meta)) if meta else body
     lines = []
     for cal_name, events in grouped.items():
         lines.append(f"## {cal_name} ({len(events)} events)")
@@ -138,7 +117,7 @@ def format_events_grouped(
                 lines.append(format_event_line(ev))
         lines.append("")
     body = "\n".join(lines).rstrip()
-    return _append_meta(body, meta)
+    return append_meta(body, meta_envelope(**meta)) if meta else body
 
 
 def format_event_detail(event: dict[str, Any]) -> str:
@@ -201,7 +180,8 @@ def format_calendar_list(
     human-readable output).
     """
     if not calendars:
-        return _append_meta("(no calendars)", meta)
+        body = "(no calendars)"
+        return append_meta(body, meta_envelope(**meta)) if meta else body
     lines = []
     for cal in calendars:
         # DD-338 B.2: error-row variant — partial-provider failure provenance
@@ -218,7 +198,7 @@ def format_calendar_list(
         parts.append(f"uid={uid}")
         lines.append(" | ".join(parts))
     body = "\n".join(lines)
-    return _append_meta(body, meta)
+    return append_meta(body, meta_envelope(**meta)) if meta else body
 
 
 def format_info(info: dict[str, Any]) -> str:
@@ -246,11 +226,12 @@ def format_freebusy(
     DD-338 Phase C Wave 2 — appends an optional ``_meta`` envelope.
     """
     if not periods:
-        return _append_meta("(no busy periods — completely free)", meta)
+        body = "(no busy periods — completely free)"
+        return append_meta(body, meta_envelope(**meta)) if meta else body
     lines = []
     for p in periods:
         start = _format_time(p.get("start"))
         end = _format_time(p.get("end"))
         lines.append(f"BUSY {start}-{end}")
     body = "\n".join(lines)
-    return _append_meta(body, meta)
+    return append_meta(body, meta_envelope(**meta)) if meta else body

@@ -1,6 +1,6 @@
 [project]
 name = "caldav-blade-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "CalDAV MCP Server — calendar events, scheduling, and availability"
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,6 +21,7 @@ dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.0.0",
     "python-dateutil>=2.9.0",
+    "stallari-mcp-helpers>=0.1.0,<1.0.0",
 ]
 
 [dependency-groups]
@@ -73,3 +74,10 @@ warn_unused_ignores = true
 strict_equality = true
 show_error_codes = true
 pretty = true
+
+# DD-338 Phase E.python — canonical helpers lib v0.1.0 ships without py.typed
+# (tracked as a Spec A v0.2 follow-up). Silence import-untyped here until the
+# lib ships marker + stubs.
+[[tool.mypy.overrides]]
+module = "stallari_mcp_helpers.*"
+ignore_missing_imports = true
