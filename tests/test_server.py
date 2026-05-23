@@ -126,7 +126,10 @@ class TestReadTools:
     async def test_cal_today_empty(self, mock_client: MagicMock) -> None:
         mock_client.get_today.return_value = {}
         result = await cal_today()
-        assert "no events today" in result
+        # DD-338 Phase C Wave 2 — empty payload routed through format_events_grouped
+        # which renders "(no events)" + _meta envelope tail.
+        assert "no events" in result
+        assert "_meta:" in result
 
     async def test_cal_week(self, mock_client: MagicMock) -> None:
         mock_client.get_week.return_value = {

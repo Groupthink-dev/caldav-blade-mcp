@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from datetime import date
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
@@ -92,10 +94,28 @@ async def cal_info() -> str:
 
 @mcp.tool()
 async def cal_calendars() -> str:
-    """List all calendars across all providers. Returns name, UID, and provider for each."""
+    """List all calendars across all providers. Returns name, UID, and provider for each.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope. Per-provider
+    failures from the B.2 partial-tolerance softening surface as
+    ``error_notes`` rows in ``_meta`` (mirror of the in-band ⚠-prefix payload
+    rows). Assembler can lift these into ``ContextOmission`` records.
+    """
+    started = time.perf_counter()
     try:
         calendars = await _run(_get_client().list_calendars)
-        return format_calendar_list(calendars)
+        # Split error rows (B.2 partial-tolerance) from real calendar rows.
+        error_rows = [c for c in calendars if "error" in c and not c.get("name") and not c.get("uid")]
+        real_rows = [c for c in calendars if c not in error_rows]
+        meta: dict[str, Any] = {
+            "matched_total": len(real_rows),
+            "returned": len(real_rows),
+            "filtered_by": [],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+        if error_rows:
+            meta["error_notes"] = [f"provider={r.get('provider', '?')}: {r.get('error', '?')}" for r in error_rows]
+        return format_calendar_list(calendars, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 
@@ -106,10 +126,21 @@ async def cal_events(
     start: Annotated[str, Field(description="Start of range (ISO 8601, e.g. 2026-03-13T00:00:00+11:00)")],
     end: Annotated[str, Field(description="End of range (ISO 8601)")],
 ) -> str:
-    """Get events from a single calendar in a date range. Compact one-line-per-event output."""
+    """Get events from a single calendar in a date range. Compact one-line-per-event output.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope disclosing
+    the server-side ``calendar=`` + ``time_range=`` discrimination.
+    """
+    started = time.perf_counter()
     try:
         events = await _run(_get_client().get_events, calendar, start, end)
-        return format_event_list(events)
+        meta: dict[str, Any] = {
+            "matched_total": len(events),
+            "returned": len(events),
+            "filtered_by": [f"calendar={calendar}", f"time_range={start}..{end}"],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+        return format_event_list(events, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 
@@ -123,10 +154,20 @@ async def cal_events_batch(
     """Get events from multiple calendars in one call, grouped by calendar.
 
     Preferred for digests and multi-calendar views — replaces N individual cal_events calls.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope.
     """
+    started = time.perf_counter()
     try:
         grouped = await _run(_get_client().get_events_batch, calendars, start, end)
-        return format_events_grouped(grouped)
+        total = sum(len(v) for v in grouped.values())
+        meta: dict[str, Any] = {
+            "matched_total": total,
+            "returned": total,
+            "filtered_by": [f"calendars={len(calendars)}", f"time_range={start}..{end}"],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+        return format_events_grouped(grouped, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 
@@ -155,7 +196,13 @@ async def cal_search(
     start: Annotated[str | None, Field(description="Earliest event start (ISO 8601)")] = None,
     end: Annotated[str | None, Field(description="Latest event end (ISO 8601)")] = None,
 ) -> str:
-    """Search events by text, attendee email, or location. Optional calendar and date scope."""
+    """Search events by text, attendee email, or location. Optional calendar and date scope.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope; the
+    underlying CalDAV REPORT honours all named args server-side
+    (``scope_filtering: server-side`` per OQ-1 ratification).
+    """
+    started = time.perf_counter()
     try:
         events = await _run(
             _get_client().search_events,
@@ -166,19 +213,47 @@ async def cal_search(
             start=start,
             end=end,
         )
-        return format_event_list(events)
+        filtered_by: list[str] = []
+        if query is not None:
+            filtered_by.append(f"query={query}")
+        if attendee is not None:
+            filtered_by.append(f"attendee={attendee}")
+        if location is not None:
+            filtered_by.append(f"location={location}")
+        if calendar is not None:
+            filtered_by.append(f"calendar={calendar}")
+        if start is not None or end is not None:
+            filtered_by.append(f"time_range={start or '?'}..{end or '?'}")
+        meta: dict[str, Any] = {
+            "matched_total": len(events),
+            "returned": len(events),
+            "filtered_by": filtered_by,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+        return format_event_list(events, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 
 
 @mcp.tool()
 async def cal_today() -> str:
-    """Today's events across all calendars, grouped by calendar. Compact output."""
+    """Today's events across all calendars, grouped by calendar. Compact output.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope.
+    """
+    started = time.perf_counter()
     try:
         grouped = await _run(_get_client().get_today)
+        total = sum(len(v) for v in grouped.values()) if grouped else 0
+        meta: dict[str, Any] = {
+            "matched_total": total,
+            "returned": total,
+            "filtered_by": [f"date={date.today().isoformat()}"],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
         if not grouped:
-            return "(no events today)"
-        return format_events_grouped(grouped)
+            return format_events_grouped({}, meta=meta)
+        return format_events_grouped(grouped, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 
@@ -187,12 +262,26 @@ async def cal_today() -> str:
 async def cal_week(
     start_monday: Annotated[bool, Field(description="If true, week starts Monday; otherwise starts today")] = True,
 ) -> str:
-    """This week's events across all calendars, grouped by calendar. Compact output."""
+    """This week's events across all calendars, grouped by calendar. Compact output.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope.
+    """
+    started = time.perf_counter()
     try:
         grouped = await _run(_get_client().get_week, start_monday)
+        total = sum(len(v) for v in grouped.values()) if grouped else 0
+        meta: dict[str, Any] = {
+            "matched_total": total,
+            "returned": total,
+            "filtered_by": [
+                f"start_monday={start_monday}",
+                "week=7d",
+            ],
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
         if not grouped:
-            return "(no events this week)"
-        return format_events_grouped(grouped)
+            return format_events_grouped({}, meta=meta)
+        return format_events_grouped(grouped, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 
@@ -203,10 +292,23 @@ async def cal_freebusy(
     end: Annotated[str, Field(description="End of range (ISO 8601)")],
     calendar: Annotated[str | None, Field(description="Restrict to one calendar")] = None,
 ) -> str:
-    """Free/busy query for a date range. Returns only busy periods — very token-efficient for availability checks."""
+    """Free/busy query for a date range. Returns only busy periods — very token-efficient for availability checks.
+
+    DD-338 Phase C Wave 2 — emits a structured ``_meta`` envelope.
+    """
+    started = time.perf_counter()
     try:
         periods = await _run(_get_client().freebusy, start, end, calendar)
-        return format_freebusy(periods)
+        filtered_by: list[str] = [f"time_range={start}..{end}"]
+        if calendar is not None:
+            filtered_by.append(f"calendar={calendar}")
+        meta: dict[str, Any] = {
+            "matched_total": len(periods),
+            "returned": len(periods),
+            "filtered_by": filtered_by,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+        }
+        return format_freebusy(periods, meta=meta)
     except CalDAVError as e:
         return _error_response(e)
 

@@ -22,13 +22,18 @@ declaration would be fake-compliance — exactly what cf_d1_query rejects.
 
 from __future__ import annotations
 
+import json
+import re
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from caldav_blade_mcp.client import CalDAVClient
 from caldav_blade_mcp.models import ProviderConfig
 from caldav_blade_mcp.server import (
     cal_calendars,
+    cal_events,
     cal_events_batch,
+    cal_freebusy,
     cal_info,
     cal_search,
     cal_today,
@@ -75,8 +80,15 @@ def _extract_lines_set(formatted: str) -> frozenset[str]:
     For honest-unsorted tools we assert SET equality — same lines may appear
     in different order across invocations; the contract is that the SET of
     records is invariant.
+
+    DD-338 Phase C Wave 2 — skips the trailing ``_meta:`` JSON line (the
+    envelope carries non-deterministic ``latency_ms``).
     """
-    return frozenset(line for line in formatted.splitlines() if line.strip() and not line.startswith("##"))
+    return frozenset(
+        line
+        for line in formatted.splitlines()
+        if line.strip() and not line.startswith("##") and not line.startswith("_meta:")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +176,15 @@ def _events_grouped_set(formatted: str) -> frozenset[tuple[str, frozenset[str]]]
 
     For unsorted tools, both the outer calendar order AND inner event order
     are NOT contractually stable — only the set of records is.
+
+    DD-338 Phase C Wave 2 — skips the trailing ``_meta:`` JSON line.
     """
     groups: dict[str, list[str]] = {}
     current_cal: str | None = None
     for line in formatted.splitlines():
+        if line.startswith("_meta:"):
+            # Tail envelope — done with grouped content.
+            break
         if line.startswith("## "):
             # "## Work (3 events)" → "Work"
             cal_part = line[3:].rsplit(" (", 1)[0]
@@ -383,3 +400,260 @@ class TestNoDefensiveSortUnderUnsorted:
             "cal_search must NOT apply a defensive (start, uid) sort — OQ-2 RATIFIED NO. "
             f"Found order {uids!r}; expected ['zzz-a', 'mmm-b', 'aaa-c'] (cal.search() order preserved)."
         )
+
+
+# ---------------------------------------------------------------------------
+# DD-338 Phase C Wave 2 — _meta envelope per-tool + N=3 byte-equal determinism
+# ---------------------------------------------------------------------------
+
+
+_META_RE = re.compile(r"\n\n_meta: (\{.*\})$", re.DOTALL)
+
+
+def _split_meta(text: str) -> tuple[str, dict[str, Any]]:
+    m = _META_RE.search(text)
+    assert m is not None, f"_meta envelope not found in:\n{text!r}"
+    return text[: m.start()], json.loads(m.group(1))
+
+
+def _strip_latency(text: str) -> str:
+    payload, meta = _split_meta(text)
+    meta.pop("latency_ms", None)
+    return payload + "\n\n_meta: " + json.dumps(meta, sort_keys=True)
+
+
+def _check_meta_shape(meta: dict[str, Any]) -> None:
+    assert isinstance(meta["matched_total"], int)
+    assert isinstance(meta["returned"], int)
+    assert isinstance(meta["filtered_by"], list)
+    assert isinstance(meta["latency_ms"], int)
+
+
+class TestCalCalendarsMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.list_calendars.return_value = [
+            {"name": "Work", "uid": "w-1", "provider": "fastmail"},
+            {"name": "Personal", "uid": "p-1", "provider": "fastmail"},
+        ]
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(await cal_calendars())
+        _check_meta_shape(meta)
+        assert meta["matched_total"] == 2
+        assert meta["returned"] == 2
+        assert meta["filtered_by"] == []
+
+    async def test_meta_error_notes_per_provider_failure(self) -> None:
+        """OQ-6: per-provider failures surface as structured error_notes rows."""
+        client = MagicMock()
+        client.list_calendars.return_value = [
+            {"name": "Work", "uid": "w-1", "provider": "fastmail"},
+            {"provider": "icloud", "error": "Connection timeout"},
+        ]
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            payload, meta = _split_meta(await cal_calendars())
+        # Real-row count, not including the error row
+        assert meta["matched_total"] == 1
+        assert meta["returned"] == 1
+        assert "error_notes" in meta
+        assert any("icloud" in n and "Connection timeout" in n for n in meta["error_notes"])
+        # In-band ⚠ row still present in payload
+        assert "⚠ icloud" in payload
+
+
+class TestCalEventsMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.get_events.return_value = [
+            {
+                "uid": "ev-1",
+                "title": "A",
+                "start": "2026-03-13T09:00:00+00:00",
+                "end": "2026-03-13T09:30:00+00:00",
+                "all_day": False,
+            },
+        ]
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(
+                await cal_events("Work", "2026-03-13T00:00:00+00:00", "2026-03-14T00:00:00+00:00")
+            )
+        _check_meta_shape(meta)
+        assert meta["returned"] == 1
+        assert "calendar=Work" in meta["filtered_by"]
+        assert any("time_range=" in f for f in meta["filtered_by"])
+
+
+class TestCalEventsBatchMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.get_events_batch.return_value = {
+            "Work": [
+                {
+                    "uid": "ev-1",
+                    "title": "A",
+                    "start": "2026-03-13T10:00:00+00:00",
+                    "end": "2026-03-13T11:00:00+00:00",
+                    "all_day": False,
+                }
+            ],
+            "Personal": [],
+        }
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(
+                await cal_events_batch(
+                    ["Work", "Personal"],
+                    "2026-03-13T00:00:00+00:00",
+                    "2026-03-14T00:00:00+00:00",
+                )
+            )
+        _check_meta_shape(meta)
+        assert meta["returned"] == 1
+        assert "calendars=2" in meta["filtered_by"]
+
+
+class TestCalSearchMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.search_events.return_value = [
+            {
+                "uid": "ev-1",
+                "title": "dentist",
+                "start": "2026-03-13T14:00:00+00:00",
+                "end": "2026-03-13T15:00:00+00:00",
+                "all_day": False,
+            },
+        ]
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(await cal_search(query="dentist", attendee="me@x.com"))
+        _check_meta_shape(meta)
+        assert "query=dentist" in meta["filtered_by"]
+        assert "attendee=me@x.com" in meta["filtered_by"]
+
+
+class TestCalTodayMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.get_today.return_value = {
+            "Work": [
+                {
+                    "uid": "ev-1",
+                    "title": "x",
+                    "start": "2026-03-13T09:00:00+00:00",
+                    "end": "2026-03-13T09:30:00+00:00",
+                    "all_day": False,
+                }
+            ],
+        }
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(await cal_today())
+        _check_meta_shape(meta)
+        assert meta["returned"] == 1
+        assert any(f.startswith("date=") for f in meta["filtered_by"])
+
+
+class TestCalWeekMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.get_week.return_value = {
+            "Work": [
+                {
+                    "uid": "ev-1",
+                    "title": "x",
+                    "start": "2026-03-13T09:00:00+00:00",
+                    "end": "2026-03-13T09:30:00+00:00",
+                    "all_day": False,
+                }
+            ],
+        }
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(await cal_week(start_monday=True))
+        _check_meta_shape(meta)
+        assert "start_monday=True" in meta["filtered_by"]
+        assert "week=7d" in meta["filtered_by"]
+
+
+class TestCalFreebusyMeta:
+    async def test_meta_envelope_shape(self) -> None:
+        client = MagicMock()
+        client.freebusy.return_value = [
+            {"start": "2026-03-13T09:00:00+00:00", "end": "2026-03-13T10:00:00+00:00"},
+        ]
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            _payload, meta = _split_meta(
+                await cal_freebusy("2026-03-13T00:00:00+00:00", "2026-03-14T00:00:00+00:00", calendar="Work")
+            )
+        _check_meta_shape(meta)
+        assert "calendar=Work" in meta["filtered_by"]
+        assert any("time_range=" in f for f in meta["filtered_by"])
+
+
+# ---------------------------------------------------------------------------
+# Helper-shape direct test for _append_meta
+# ---------------------------------------------------------------------------
+
+
+class TestAppendMetaHelper:
+    def test_helper_appends_envelope(self) -> None:
+        from caldav_blade_mcp.formatters import _append_meta
+
+        meta = {
+            "matched_total": 5,
+            "returned": 3,
+            "filtered_by": ["scope=work"],
+            "latency_ms": 42,
+        }
+        body = "line1\nline2"
+        out = _append_meta(body, meta)
+        assert out.startswith("line1\nline2\n\n_meta: ")
+        parsed = json.loads(out.split("_meta: ", 1)[1])
+        assert parsed == meta
+
+    def test_helper_passthrough_when_meta_none(self) -> None:
+        from caldav_blade_mcp.formatters import _append_meta
+
+        body = "hello"
+        assert _append_meta(body, None) == body
+
+
+# ---------------------------------------------------------------------------
+# DD-338 Phase C Wave 2 — N=3 byte-equal determinism per promoted tool
+# ---------------------------------------------------------------------------
+
+
+class TestCalDeterministicN3:
+    async def test_cal_events_byte_equal_n3(self) -> None:
+        client = MagicMock()
+        client.get_events.return_value = [
+            {
+                "uid": "ev-1",
+                "title": "A",
+                "start": "2026-03-13T09:00:00+00:00",
+                "end": "2026-03-13T09:30:00+00:00",
+                "all_day": False,
+            },
+        ]
+        outs: list[str] = []
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            for _ in range(3):
+                outs.append(
+                    _strip_latency(await cal_events("Work", "2026-03-13T00:00:00+00:00", "2026-03-14T00:00:00+00:00"))
+                )
+        assert all(o == outs[0] for o in outs)
+
+    async def test_cal_freebusy_byte_equal_n3(self) -> None:
+        client = MagicMock()
+        client.freebusy.return_value = [
+            {"start": "2026-03-13T09:00:00+00:00", "end": "2026-03-13T10:00:00+00:00"},
+        ]
+        outs: list[str] = []
+        with patch("caldav_blade_mcp.server._get_client", return_value=client):
+            for _ in range(3):
+                outs.append(
+                    _strip_latency(
+                        await cal_freebusy(
+                            "2026-03-13T00:00:00+00:00",
+                            "2026-03-14T00:00:00+00:00",
+                        )
+                    )
+                )
+        assert all(o == outs[0] for o in outs)

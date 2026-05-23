@@ -9,9 +9,44 @@ All formatters return compact strings optimised for LLM consumption:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from dateutil.parser import isoparse
+
+# ---------------------------------------------------------------------------
+# DD-338 Phase C Wave 2 — _meta envelope (JSON-tail block)
+# ---------------------------------------------------------------------------
+#
+# Canonical wire shape (architect amendment 2026-05-21, mastodon A.1 precedent):
+#
+#     <existing payload>
+#
+#     _meta: {"matched_total": N, "returned": M, "filtered_by": [...], ...}
+#
+# Single JSON line, appended after \n\n. Assembler regex:
+#     \n\n_meta: (\{.*\})$
+#
+# Required fields: matched_total, returned, filtered_by, latency_ms.
+# Optional: redactions, next_cursor, error_notes.
+
+
+def _append_meta(body: str, meta: dict[str, Any] | None) -> str:
+    """Append a DD-338 _meta envelope as a JSON-tail block.
+
+    Regex contract (assembler-side): ``\\n\\n_meta: (\\{.*\\})$``
+    Required fields: ``matched_total``, ``returned``, ``filtered_by``,
+    ``latency_ms``. Optional: ``redactions``, ``next_cursor``, ``error_notes``.
+
+    Returns ``body`` unchanged when ``meta`` is ``None`` (back-compat for
+    write-tool formatters that don't emit an envelope).
+    """
+    if meta is None:
+        return body
+    envelope = "_meta: " + json.dumps(meta, separators=(",", ":"), ensure_ascii=False)
+    if not body:
+        return envelope
+    return f"{body}\n\n{envelope}"
 
 
 def _format_time(iso_str: str | None, all_day: bool = False) -> str:
@@ -61,19 +96,35 @@ def format_event_line(event: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
-def format_event_list(events: list[dict[str, Any]]) -> str:
-    """Format a list of events as compact lines."""
+def format_event_list(
+    events: list[dict[str, Any]],
+    *,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    """Format a list of events as compact lines.
+
+    DD-338 Phase C Wave 2 — when ``meta`` is provided, appends a ``_meta``
+    JSON-tail envelope per the structured audit-surface contract.
+    """
     if not events:
-        return "(no events)"
+        return _append_meta("(no events)", meta)
     # Sort by start time
     events = sorted(events, key=lambda e: e.get("start") or "")
-    return "\n".join(format_event_line(e) for e in events)
+    body = "\n".join(format_event_line(e) for e in events)
+    return _append_meta(body, meta)
 
 
-def format_events_grouped(grouped: dict[str, list[dict[str, Any]]]) -> str:
-    """Format events grouped by calendar name."""
+def format_events_grouped(
+    grouped: dict[str, list[dict[str, Any]]],
+    *,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    """Format events grouped by calendar name.
+
+    DD-338 Phase C Wave 2 — appends an optional ``_meta`` envelope.
+    """
     if not grouped:
-        return "(no events)"
+        return _append_meta("(no events)", meta)
     lines = []
     for cal_name, events in grouped.items():
         lines.append(f"## {cal_name} ({len(events)} events)")
@@ -86,7 +137,8 @@ def format_events_grouped(grouped: dict[str, list[dict[str, Any]]]) -> str:
             for ev in events_sorted:
                 lines.append(format_event_line(ev))
         lines.append("")
-    return "\n".join(lines).rstrip()
+    body = "\n".join(lines).rstrip()
+    return _append_meta(body, meta)
 
 
 def format_event_detail(event: dict[str, Any]) -> str:
@@ -130,7 +182,11 @@ def format_event_detail(event: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_calendar_list(calendars: list[dict[str, Any]]) -> str:
+def format_calendar_list(
+    calendars: list[dict[str, Any]],
+    *,
+    meta: dict[str, Any] | None = None,
+) -> str:
     """Format calendar list as compact lines.
 
     DD-338 B.2: rows with an ``error`` key (and no ``name`` / ``uid``) render
@@ -138,9 +194,14 @@ def format_calendar_list(calendars: list[dict[str, Any]]) -> str:
     ``⚠ icloud: Connection timeout (no calendars listed)``. This surfaces
     partial-provider failures without breaking the existing line-per-row
     output contract.
+
+    DD-338 Phase C Wave 2 — appends an optional ``_meta`` envelope. When
+    ``error_notes`` is populated in ``meta`` it carries the per-provider
+    failure rows in structured form (the in-band ⚠-prefix rows remain for
+    human-readable output).
     """
     if not calendars:
-        return "(no calendars)"
+        return _append_meta("(no calendars)", meta)
     lines = []
     for cal in calendars:
         # DD-338 B.2: error-row variant — partial-provider failure provenance
@@ -156,7 +217,8 @@ def format_calendar_list(calendars: list[dict[str, Any]]) -> str:
             parts.append(f"provider={provider}")
         parts.append(f"uid={uid}")
         lines.append(" | ".join(parts))
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return _append_meta(body, meta)
 
 
 def format_info(info: dict[str, Any]) -> str:
@@ -174,13 +236,21 @@ def format_info(info: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def format_freebusy(periods: list[dict[str, str]]) -> str:
-    """Format free/busy periods as compact lines."""
+def format_freebusy(
+    periods: list[dict[str, str]],
+    *,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    """Format free/busy periods as compact lines.
+
+    DD-338 Phase C Wave 2 — appends an optional ``_meta`` envelope.
+    """
     if not periods:
-        return "(no busy periods — completely free)"
+        return _append_meta("(no busy periods — completely free)", meta)
     lines = []
     for p in periods:
         start = _format_time(p.get("start"))
         end = _format_time(p.get("end"))
         lines.append(f"BUSY {start}-{end}")
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return _append_meta(body, meta)
