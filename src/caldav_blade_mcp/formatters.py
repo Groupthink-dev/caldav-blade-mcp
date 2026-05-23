@@ -131,11 +131,23 @@ def format_event_detail(event: dict[str, Any]) -> str:
 
 
 def format_calendar_list(calendars: list[dict[str, Any]]) -> str:
-    """Format calendar list as compact lines."""
+    """Format calendar list as compact lines.
+
+    DD-338 B.2: rows with an ``error`` key (and no ``name`` / ``uid``) render
+    as in-band provenance warnings on their own line — e.g.
+    ``⚠ icloud: Connection timeout (no calendars listed)``. This surfaces
+    partial-provider failures without breaking the existing line-per-row
+    output contract.
+    """
     if not calendars:
         return "(no calendars)"
     lines = []
     for cal in calendars:
+        # DD-338 B.2: error-row variant — partial-provider failure provenance
+        if "error" in cal and not cal.get("uid") and not cal.get("name"):
+            provider = cal.get("provider", "?")
+            lines.append(f"⚠ {provider}: {cal['error']} (no calendars listed)")
+            continue
         name = cal.get("name") or "(unnamed)"
         uid = cal.get("uid", "")
         provider = cal.get("provider", "")
