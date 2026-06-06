@@ -106,11 +106,38 @@ def make_calendar_obj(name: str = "Test Calendar", cal_id: str = "test-cal-id") 
 
 
 def make_event_obj(vevent: MagicMock | None = None) -> MagicMock:
-    """Create a mock caldav event object wrapping a VEVENT."""
+    """Create a mock caldav event object wrapping a VEVENT.
+
+    The returned object mirrors the caldav ``CalendarObjectResource`` surface the
+    write paths rely on: ``.icalendar_instance`` (read), ``.delete()`` (delete),
+    and ``.edit_icalendar_instance()`` (update context manager). ``object_by_uid``
+    is intentionally NOT stubbed — D2/D4 route UID lookups through ``cal.search``.
+    """
     if vevent is None:
         vevent = make_vevent()
     event = MagicMock()
     ical = MagicMock()
     ical.subcomponents = [vevent]
     event.icalendar_instance = ical
+    # edit_icalendar_instance() is used as a context manager yielding the ical.
+    edit_cm = MagicMock()
+    edit_cm.__enter__ = lambda self: ical
+    edit_cm.__exit__ = lambda self, *a: False
+    event.edit_icalendar_instance.return_value = edit_cm
     return event
+
+
+def make_searchable_calendar(
+    name: str = "Test Calendar",
+    cal_id: str = "test-cal-id",
+    events: list[MagicMock] | None = None,
+) -> MagicMock:
+    """Create a mock calendar whose ``search(event=True)`` returns UID-matchable events.
+
+    Used by the D2/D4 ``_find_event``/``_search_event_by_uid`` tests: the lookup
+    iterates ``cal.search(...)`` results and matches on each VEVENT's ``UID``, so
+    the calendar must surface event objects (not bare comps) through ``search``.
+    """
+    cal = make_calendar_obj(name, cal_id)
+    cal.search.return_value = list(events) if events else []
+    return cal

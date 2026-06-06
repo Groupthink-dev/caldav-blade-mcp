@@ -334,6 +334,10 @@ async def cal_create(
         Field(description="List of {email, name?, status?} dicts"),
     ] = None,
     alarm_minutes: Annotated[int | None, Field(description="Minutes before event for reminder")] = None,
+    all_day: Annotated[
+        bool | None,
+        Field(description="Force all-day (date-only) event; auto-detected from date-only ISO start/end if omitted"),
+    ] = None,
 ) -> str:
     """Create a new calendar event. Requires CALDAV_WRITE_ENABLED=true."""
     gate = require_write()
@@ -351,6 +355,7 @@ async def cal_create(
             recurrence_rule=recurrence_rule,
             attendees=attendees,
             alarm_minutes=alarm_minutes,
+            all_day=all_day,
         )
         return f"Created: {format_event_detail(event)}"
     except CalDAVError as e:
@@ -367,6 +372,10 @@ async def cal_update(
     description: Annotated[str | None, Field(description="New description (empty string to clear)")] = None,
     location: Annotated[str | None, Field(description="New location (empty string to clear)")] = None,
     recurrence_rule: Annotated[str | None, Field(description="New RRULE (empty string to clear)")] = None,
+    all_day: Annotated[
+        bool | None,
+        Field(description="Force all-day (date-only) event; auto-detected from date-only ISO start/end if omitted"),
+    ] = None,
 ) -> str:
     """Partial update of an event by UID. Only changed fields sent. Auto-increments SEQUENCE.
 
@@ -386,6 +395,7 @@ async def cal_update(
             description=description,
             location=location,
             recurrence_rule=recurrence_rule,
+            all_day=all_day,
         )
         return f"Updated: {format_event_detail(event)}"
     except CalDAVError as e:
@@ -416,11 +426,14 @@ async def cal_move(
     event_uid: Annotated[str, Field(description="UID of the event to move")],
     from_calendar: Annotated[str, Field(description="Source calendar name or UID")],
     to_calendar: Annotated[str, Field(description="Destination calendar name or UID")],
+    confirm: Annotated[bool, Field(description="Must be true to confirm move")] = False,
 ) -> str:
-    """Move an event between calendars. Requires CALDAV_WRITE_ENABLED=true."""
+    """Move an event between calendars. Requires confirm=true and CALDAV_WRITE_ENABLED=true."""
     gate = require_write()
     if gate:
         return gate
+    if not confirm:
+        return "Error: Set confirm=true to confirm move. The source event will be deleted after a successful copy."
     try:
         event = await _run(
             _get_client().move_event,

@@ -213,6 +213,13 @@ class TestWriteTools:
             result = await cal_move("ev-1", "Work", "Personal")
             assert "Error: Write operations are disabled" in result
 
+    async def test_cal_move_requires_confirm(self, mock_client: MagicMock) -> None:
+        # D7 guard-parity with cal_delete: no confirm => move refused, client untouched.
+        with patch("caldav_blade_mcp.server.require_write", return_value=None):
+            result = await cal_move("ev-1", "Work", "Personal")
+            assert "confirm=true" in result
+            mock_client.move_event.assert_not_called()
+
     async def test_cal_move_allowed(self, mock_client: MagicMock) -> None:
         mock_client.move_event.return_value = {
             "uid": "ev-1",
@@ -222,5 +229,5 @@ class TestWriteTools:
             "all_day": False,
         }
         with patch("caldav_blade_mcp.server.require_write", return_value=None):
-            result = await cal_move("ev-1", "Work", "Personal")
+            result = await cal_move("ev-1", "Work", "Personal", confirm=True)
             assert "Moved to Personal" in result
