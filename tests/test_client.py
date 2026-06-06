@@ -401,6 +401,36 @@ class TestAllDayConstruction:
         assert isinstance(added["DTSTART"], date)
         assert not isinstance(added["DTSTART"], datetime)
 
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_update_calls_save_to_persist(self, mock_dav_cls: MagicMock) -> None:
+        # D13: edit_icalendar_instance() only borrows the object — it does NOT PUT
+        # on context exit. update_event MUST call event.save() or the edit is
+        # silently discarded on the wire (proven live on iCloud).
+        event_obj = make_event_obj(make_vevent(uid="ev-1"))
+        cal = make_searchable_calendar("Work", "work-id", events=[event_obj])
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.update_event("ev-1", calendar="Work", title="Renamed")
+
+        event_obj.save.assert_called_once()
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_create_with_extras_calls_save_to_persist(self, mock_dav_cls: MagicMock) -> None:
+        # D13: the recurrence/attendee/alarm fields are applied via
+        # edit_icalendar_instance(), which does NOT persist on its own — create_event
+        # MUST call event.save() after the edit block or they vanish on the wire.
+        event_obj = make_event_obj(make_vevent(uid="ev-1"))
+        cal = make_searchable_calendar("Work", "work-id", events=[event_obj])
+        cal.save_event.return_value = event_obj
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.create_event(
+            "Work", "Standup", start="2026-06-10T09:00:00+10:00", end="2026-06-10T09:30:00+10:00",
+            attendees=[{"email": "a@example.com", "name": "A"}], alarm_minutes=15,
+        )
+
+        event_obj.save.assert_called_once()
+
 
 class TestFindEventViaSearch:
     """D2/D4 — UID lookup uses cal.search, never object_by_uid."""

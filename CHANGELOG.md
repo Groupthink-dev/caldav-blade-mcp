@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.0] - 2026-06-07
 
-### Fixed (DD-385 live-hardening — 10 of 12 audit defects)
+### Fixed (DD-385 live-hardening — 10 of 12 audit defects + D13 found live)
 
 Live-hardened against iCloud CalDAV; every fix came from a live failure the
 mock suite passed straight through (DD-385 meta-lesson).
+
+- **D13 — writes silently discarded (blocking; found by the live e2e):**
+  `caldav` 3.x `edit_icalendar_instance()` only *borrows* the object for
+  in-memory editing — it does NOT PUT on context exit; an explicit `event.save()`
+  is required. The blade never called it, so `update_event` persisted *nothing*
+  (the rename never reached the wire) and `create_event`'s recurrence/attendee/
+  alarm fields (hence `move_event`'s fidelity) were silently dropped. Added
+  `event.save()` after both edit blocks. Proven live: rename + attendees + alarm
+  now persist on iCloud. Missed by the audit, the spec-verify, AND the mocks —
+  caught only by the live round-trip.
 
 - **D2/D4 — UID lookup (blocking):** `_find_event` resolved events via
   `caldav.object_by_uid`, which iCloud answers with `412 Precondition Failed`

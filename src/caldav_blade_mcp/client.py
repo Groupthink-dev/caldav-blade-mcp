@@ -586,6 +586,11 @@ class CalDAVClient:
                             alarm.add("action", "DISPLAY")
                             alarm.add("trigger", timedelta(minutes=-alarm_minutes))
                             comp.add_component(alarm)
+                # D13: edit_icalendar_instance() only BORROWS the object for
+                # in-memory editing — it does NOT PUT on context exit. Without an
+                # explicit save() the recurrence/attendee/alarm fields are silently
+                # dropped on the wire (proven live on iCloud). Persist them.
+                event.save()
         except caldav.lib.error.DAVError as exc:
             raise _classify_error(_scrub_credentials(str(exc))) from exc
 
@@ -678,6 +683,10 @@ class CalDAVClient:
                             del comp[field]
                     comp.add("LAST-MODIFIED", now)
                     comp.add("DTSTAMP", now)
+            # D13: edit_icalendar_instance() only BORROWS for in-memory editing —
+            # it does NOT PUT on exit. Without this save() the update is silently
+            # discarded (proven live on iCloud: the rename never reached the wire).
+            event.save()
         except caldav.lib.error.DAVError as exc:
             raise _classify_error(_scrub_credentials(str(exc))) from exc
 
