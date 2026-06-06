@@ -192,12 +192,24 @@ class _ProviderConnection:
 
     def connect(self) -> None:
         if self._dav is None:
-            self._dav = DAVClient(
+            dav = DAVClient(
                 url=self.config.url,
                 username=self.config.username,
                 password=self.config.password,
             )
-            self._principal = self._dav.principal()
+            # D5: principal() is the fallible auth step. Assign the cached handle
+            # ONLY after it succeeds — otherwise an auth failure leaves _dav set
+            # but _principal None, the `_dav is None` guard never re-attempts, and
+            # every later call returns None -> a misleading AttributeError instead
+            # of the real AuthorizationError. Roll back on failure so the next call
+            # re-attempts and re-surfaces the true error.
+            try:
+                self._principal = dav.principal()
+            except Exception:
+                self._dav = None
+                self._principal = None
+                raise
+            self._dav = dav
             logger.info("Connected to CalDAV provider: %s", self.config.name)
 
     @property
@@ -405,9 +417,15 @@ class CalDAVClient:
         dtend = isoparse(end) if end else None
         results: list[dict[str, Any]] = []
 
+        # D3: expand=True is rejected by iCloud/caldav when no date range is given
+        # ("can't expand without a date range"). A dateless search (query/attendee/
+        # location only) MUST NOT pass expand=True, or it raises and the broad except
+        # below silently returns a false-empty result on every calendar. Only expand
+        # when a date range is present.
+        expand = bool(dtstart and dtend)
         for _, cal in search_cals:
             try:
-                objs = cal.search(start=dtstart, end=dtend, event=True, expand=True)
+                objs = cal.search(start=dtstart, end=dtend, event=True, expand=expand)
                 for obj in objs:
                     for comp in obj.icalendar_instance.subcomponents:
                         if comp.name != "VEVENT":

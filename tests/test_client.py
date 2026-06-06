@@ -239,6 +239,50 @@ class TestCalDAVClient:
         assert len(result) == 1
         assert result[0]["title"] == "Meeting"
 
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_search_dateless_does_not_expand(self, mock_dav_cls: MagicMock) -> None:
+        # D3: a dateless search MUST NOT pass expand=True (iCloud/caldav reject
+        # "expand without a date range" and the broad except returns a false-empty).
+        cal = make_calendar_obj("All", "all-id")
+        cal.search.return_value = []
+        mock_principal = MagicMock()
+        mock_principal.calendars.return_value = [cal]
+        mock_dav_cls.return_value.principal.return_value = mock_principal
+
+        provider = ProviderConfig(name="test", url="https://example.com", username="u", password="p")
+        client = CalDAVClient(providers=[provider])
+
+        client.search_events(query="standup")
+        assert cal.search.call_args.kwargs["expand"] is False
+
+        cal.search.reset_mock()
+        client.search_events(query="standup", start="2026-06-01T00:00:00+10:00", end="2026-06-30T00:00:00+10:00")
+        assert cal.search.call_args.kwargs["expand"] is True
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_connect_auth_failure_rolls_back_and_retries(self, mock_dav_cls: MagicMock) -> None:
+        # D5: an auth failure during connect() must NOT cache a half-initialised
+        # connection. The real error must propagate (not a derived AttributeError),
+        # and a subsequent connect() must re-attempt rather than return a cached None.
+        class _BoomError(Exception):
+            pass
+
+        good_principal = MagicMock()
+        mock_dav_cls.return_value.principal.side_effect = [_BoomError("401 Unauthorized"), good_principal]
+
+        provider = ProviderConfig(name="test", url="https://example.com", username="u", password="p")
+        client = CalDAVClient(providers=[provider])
+        conn = client._providers["test"]
+
+        with pytest.raises(_BoomError):
+            conn.connect()
+        assert conn._dav is None
+        assert conn._principal is None
+
+        conn.connect()  # re-attempts; does not return a cached None
+        assert conn._principal is good_principal
+        assert mock_dav_cls.return_value.principal.call_count == 2
+
 
 class TestMultiProvider:
     @patch("caldav_blade_mcp.client.DAVClient")
