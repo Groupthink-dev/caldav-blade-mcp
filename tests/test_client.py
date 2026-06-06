@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta
+from typing import Any
 from unittest.mock import MagicMock, patch
 
+import caldav.lib.error
 import pytest
 
 from caldav_blade_mcp.client import (
@@ -15,10 +18,20 @@ from caldav_blade_mcp.client import (
     _classify_error,
     _extract_event,
     _is_all_day,
+    _parse_dt,
     _scrub_credentials,
 )
 from caldav_blade_mcp.models import ProviderConfig
-from tests.conftest import make_calendar_obj, make_event_obj, make_vevent
+from tests.conftest import make_calendar_obj, make_event_obj, make_searchable_calendar, make_vevent
+
+
+def _client_with_calendars(mock_dav_cls: MagicMock, calendars: list[MagicMock]) -> CalDAVClient:
+    """Build a single-provider CalDAVClient whose principal returns ``calendars``."""
+    mock_principal = MagicMock()
+    mock_principal.calendars.return_value = calendars
+    mock_dav_cls.return_value.principal.return_value = mock_principal
+    provider = ProviderConfig(name="test", url="https://example.com", username="u", password="p")
+    return CalDAVClient(providers=[provider])
 
 
 class TestErrorClassification:
@@ -250,3 +263,292 @@ class TestMultiProvider:
         assert len(result) == 2
         assert result[0]["provider"] == "fastmail"
         assert result[1]["provider"] == "icloud"
+
+
+class TestParseDt:
+    """D1 — date-only ISO → date (VALUE=DATE); timed ISO → datetime."""
+
+    def test_date_only_autodetect(self) -> None:
+        result = _parse_dt("2026-06-10")
+        assert isinstance(result, date)
+        assert not isinstance(result, datetime)
+        assert result == date(2026, 6, 10)
+
+    def test_timed_autodetect(self) -> None:
+        result = _parse_dt("2026-06-10T09:00:00+10:00")
+        assert isinstance(result, datetime)
+
+    def test_all_day_true_truncates_datetime(self) -> None:
+        result = _parse_dt("2026-06-10T09:00:00+10:00", all_day=True)
+        assert isinstance(result, date)
+        assert not isinstance(result, datetime)
+        assert result == date(2026, 6, 10)
+
+    def test_all_day_false_forces_datetime(self) -> None:
+        # A date-only string with all_day=False still parses as a datetime.
+        result = _parse_dt("2026-06-10", all_day=False)
+        assert isinstance(result, datetime)
+
+
+class TestAllDayConstruction:
+    """D1 — create/update must produce date instances the read path detects."""
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_create_all_day_passes_date(self, mock_dav_cls: MagicMock) -> None:
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.save_event.return_value = make_event_obj(make_vevent(uid="ev-1"))
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.create_event("Work", "Holiday", start="2026-06-10", end="2026-06-11")
+
+        kwargs = cal.save_event.call_args.kwargs
+        assert isinstance(kwargs["dtstart"], date)
+        assert not isinstance(kwargs["dtstart"], datetime)
+        assert isinstance(kwargs["dtend"], date)
+        assert not isinstance(kwargs["dtend"], datetime)
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_create_all_day_true_truncates(self, mock_dav_cls: MagicMock) -> None:
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.save_event.return_value = make_event_obj(make_vevent(uid="ev-1"))
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.create_event(
+            "Work", "Holiday", start="2026-06-10T09:00:00+10:00", end="2026-06-10T17:00:00+10:00", all_day=True
+        )
+
+        kwargs = cal.save_event.call_args.kwargs
+        assert isinstance(kwargs["dtstart"], date)
+        assert not isinstance(kwargs["dtstart"], datetime)
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_create_timed_stays_datetime(self, mock_dav_cls: MagicMock) -> None:
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.save_event.return_value = make_event_obj(make_vevent(uid="ev-1"))
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.create_event(
+            "Work", "Standup", start="2026-06-10T09:00:00+10:00", end="2026-06-10T09:30:00+10:00"
+        )
+
+        kwargs = cal.save_event.call_args.kwargs
+        assert isinstance(kwargs["dtstart"], datetime)
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_update_all_day_adds_date(self, mock_dav_cls: MagicMock) -> None:
+        vevent = make_vevent(uid="ev-1")
+        event_obj = make_event_obj(vevent)
+        cal = make_searchable_calendar("Work", "work-id", events=[event_obj])
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        # Capture what comp.add("DTSTART", ...) receives.
+        added: dict[str, Any] = {}
+        original_add = vevent.add
+
+        def capture_add(key: str, value: Any) -> Any:
+            added[key] = value
+            return original_add(key, value)
+
+        vevent.add = capture_add
+
+        client.update_event("ev-1", calendar="Work", start="2026-06-10")
+
+        assert "DTSTART" in added
+        assert isinstance(added["DTSTART"], date)
+        assert not isinstance(added["DTSTART"], datetime)
+
+
+class TestFindEventViaSearch:
+    """D2/D4 — UID lookup uses cal.search, never object_by_uid."""
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_uid_lookup_uses_search(self, mock_dav_cls: MagicMock) -> None:
+        target = make_event_obj(make_vevent(uid="ev-1"))
+        cal = make_searchable_calendar("Work", "work-id", events=[target])
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        _, resolved_cal, resolved_event = client._find_event("ev-1", "Work")
+
+        assert resolved_event is target
+        cal.search.assert_called_once()
+        # No expand on the UID lookup (D3-class 412 avoidance).
+        assert cal.search.call_args.kwargs.get("expand") is None
+        cal.object_by_uid.assert_not_called()
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_uid_no_match_raises_not_found(self, mock_dav_cls: MagicMock) -> None:
+        other = make_event_obj(make_vevent(uid="ev-other"))
+        cal = make_searchable_calendar("Work", "work-id", events=[other])
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        with pytest.raises(NotFoundError, match="not found in calendar"):
+            client._find_event("ev-1", "Work")
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_search_report_error_maps_to_caldav_error(self, mock_dav_cls: MagicMock) -> None:
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.search.side_effect = caldav.lib.error.ReportError("412 Precondition Failed")
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        with pytest.raises(CalDAVError):
+            client._find_event("ev-1", "Work")
+
+
+class TestNonFatalRefetch:
+    """D2 — a post-write re-fetch failure must not turn a landed PUT into a failure."""
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_create_refetch_failure_returns_best_effort(self, mock_dav_cls: MagicMock) -> None:
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.save_event.return_value = make_event_obj(make_vevent(uid="ev-1"))
+        # Re-fetch search blows up after the PUT landed.
+        cal.search.side_effect = caldav.lib.error.ReportError("412 Precondition Failed")
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        result = client.create_event(
+            "Work", "Standup", start="2026-06-10T09:00:00+10:00", end="2026-06-10T09:30:00+10:00"
+        )
+
+        assert result["uid"] == "ev-1"
+        assert result["title"] == "Standup"
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_update_refetch_failure_returns_best_effort(self, mock_dav_cls: MagicMock) -> None:
+        vevent = make_vevent(uid="ev-1")
+        event_obj = make_event_obj(vevent)
+        # First search resolves the event for the edit; second (re-fetch) fails.
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.search.side_effect = [[event_obj], caldav.lib.error.ReportError("412 Precondition Failed")]
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        result = client.update_event("ev-1", calendar="Work", title="Renamed")
+
+        assert result["uid"] == "ev-1"
+        assert result["title"] == "Renamed"
+
+
+class TestWriteMethodClassification:
+    """D6 — caldav DAVError from a write sink surfaces as blade CalDAVError."""
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_create_put_error_classified(self, mock_dav_cls: MagicMock) -> None:
+        cal = make_searchable_calendar("Work", "work-id")
+        cal.save_event.side_effect = caldav.lib.error.PutError("PUT failed")
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        with pytest.raises(CalDAVError):
+            client.create_event(
+                "Work", "Standup", start="2026-06-10T09:00:00+10:00", end="2026-06-10T09:30:00+10:00"
+            )
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_delete_error_classified(self, mock_dav_cls: MagicMock) -> None:
+        event_obj = make_event_obj(make_vevent(uid="ev-1"))
+        event_obj.delete.side_effect = caldav.lib.error.DeleteError("DELETE failed")
+        cal = make_searchable_calendar("Work", "work-id", events=[event_obj])
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        with pytest.raises(CalDAVError):
+            client.delete_event("ev-1", "Work")
+
+
+class TestExtractAlarm:
+    """D8 — _extract_event surfaces alarm_minutes from a VALARM TRIGGER."""
+
+    def test_alarm_extracted(self) -> None:
+        vevent = make_vevent(uid="ev-1")
+        valarm = MagicMock()
+        valarm.name = "VALARM"
+        trigger = MagicMock()
+        trigger.dt = timedelta(minutes=-15)
+        valarm.get = lambda key, default=None: {"TRIGGER": trigger}.get(key, default)
+        vevent.subcomponents = [valarm]
+
+        result = _extract_event(vevent)
+        assert result["alarm_minutes"] == 15
+
+    def test_no_alarm_is_none(self) -> None:
+        vevent = make_vevent(uid="ev-1")  # subcomponents = []
+        result = _extract_event(vevent)
+        assert result["alarm_minutes"] is None
+
+
+class TestMoveEvent:
+    """D8/D9/D10 — create-first / verify / delete-last with fidelity + no data loss."""
+
+    def _build_move_client(
+        self, mock_dav_cls: MagicMock, source_vevent: MagicMock
+    ) -> tuple[CalDAVClient, MagicMock, MagicMock, MagicMock]:
+        """Wire a from-cal (holds source) and to-cal (create target + verify)."""
+        source_obj = make_event_obj(source_vevent)
+        from_cal = make_searchable_calendar("Work", "work-id", events=[source_obj])
+
+        created_vevent = make_vevent(uid="ev-1")
+        created_obj = make_event_obj(created_vevent)
+        to_cal = make_searchable_calendar("Personal", "personal-id")
+        to_cal.save_event.return_value = make_event_obj(make_vevent(uid="ev-1"))
+        # verify search on the destination returns the created event.
+        to_cal.search.return_value = [created_obj]
+
+        client = _client_with_calendars(mock_dav_cls, [from_cal, to_cal])
+        return client, from_cal, to_cal, source_obj
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_move_threads_attendees_and_alarm(self, mock_dav_cls: MagicMock) -> None:
+        source_vevent = make_vevent(
+            uid="ev-1",
+            attendees=[{"email": "alice@example.com", "name": "Alice", "status": "ACCEPTED"}],
+        )
+        valarm = MagicMock()
+        valarm.name = "VALARM"
+        trigger = MagicMock()
+        trigger.dt = timedelta(minutes=-30)
+        valarm.get = lambda key, default=None: {"TRIGGER": trigger}.get(key, default)
+        source_vevent.subcomponents = [valarm]
+
+        client, from_cal, to_cal, _ = self._build_move_client(mock_dav_cls, source_vevent)
+        with patch.object(client, "create_event", wraps=client.create_event) as spy:
+            client.move_event("ev-1", "Work", "Personal")
+
+        ckwargs = spy.call_args.kwargs
+        assert ckwargs["attendees"] is not None
+        assert ckwargs["attendees"][0]["email"] == "alice@example.com"
+        assert ckwargs["alarm_minutes"] == 30
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_move_create_failure_never_deletes(self, mock_dav_cls: MagicMock) -> None:
+        source_vevent = make_vevent(uid="ev-1")
+        client, from_cal, to_cal, source_obj = self._build_move_client(mock_dav_cls, source_vevent)
+        # Destination create raises — source must survive.
+        to_cal.save_event.side_effect = caldav.lib.error.PutError("PUT failed")
+
+        with pytest.raises(CalDAVError):
+            client.move_event("ev-1", "Work", "Personal")
+
+        source_obj.delete.assert_not_called()
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_move_partial_success_on_delete_failure(self, mock_dav_cls: MagicMock) -> None:
+        source_vevent = make_vevent(uid="ev-1")
+        client, from_cal, to_cal, source_obj = self._build_move_client(mock_dav_cls, source_vevent)
+        # Create + verify succeed; source delete fails after the irreversible copy.
+        source_obj.delete.side_effect = caldav.lib.error.DeleteError("DELETE failed")
+
+        result = client.move_event("ev-1", "Work", "Personal")
+
+        assert "but source not removed" in result.get("move_status", "")
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_move_all_day_preserved(self, mock_dav_cls: MagicMock) -> None:
+        source_vevent = make_vevent(uid="ev-1", all_day=True)
+        client, from_cal, to_cal, _ = self._build_move_client(mock_dav_cls, source_vevent)
+        with patch.object(client, "create_event", wraps=client.create_event) as spy:
+            client.move_event("ev-1", "Work", "Personal")
+
+        ckwargs = spy.call_args.kwargs
+        assert ckwargs["all_day"] is True
+        # The all-day source serialises to a date-only ISO string; create re-parses to a date.
+        assert "T" not in ckwargs["start"]
+        save_kwargs = to_cal.save_event.call_args.kwargs
+        assert isinstance(save_kwargs["dtstart"], date)
+        assert not isinstance(save_kwargs["dtstart"], datetime)
