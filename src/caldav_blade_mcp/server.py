@@ -10,13 +10,13 @@ import asyncio
 import logging
 import os
 import time
-from datetime import date
+from datetime import timedelta
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
 
-from caldav_blade_mcp.client import CalDAVClient, CalDAVError
+from caldav_blade_mcp.client import CalDAVClient, CalDAVError, local_day_window
 from caldav_blade_mcp.formatters import (
     format_calendar_list,
     format_event_detail,
@@ -243,12 +243,16 @@ async def cal_today() -> str:
     """
     started = time.perf_counter()
     try:
+        win_start, win_end = local_day_window()
         grouped = await _run(_get_client().get_today)
         total = sum(len(v) for v in grouped.values()) if grouped else 0
         meta: dict[str, Any] = {
             "matched_total": total,
             "returned": total,
-            "filtered_by": [f"date={date.today().isoformat()}"],
+            "filtered_by": [
+                f"date={win_start.date().isoformat()}",
+                f"local_window={win_start.isoformat()}..{win_end.isoformat()}",
+            ],
             "latency_ms": int((time.perf_counter() - started) * 1000),
         }
         if not grouped:
@@ -268,6 +272,9 @@ async def cal_week(
     """
     started = time.perf_counter()
     try:
+        today_start, _ = local_day_window()
+        week_start = today_start - timedelta(days=today_start.weekday()) if start_monday else today_start
+        week_end = week_start + timedelta(days=7)
         grouped = await _run(_get_client().get_week, start_monday)
         total = sum(len(v) for v in grouped.values()) if grouped else 0
         meta: dict[str, Any] = {
@@ -276,6 +283,7 @@ async def cal_week(
             "filtered_by": [
                 f"start_monday={start_monday}",
                 "week=7d",
+                f"local_window={week_start.isoformat()}..{week_end.isoformat()}",
             ],
             "latency_ms": int((time.perf_counter() - started) * 1000),
         }
