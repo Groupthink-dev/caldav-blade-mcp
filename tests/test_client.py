@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import caldav.lib.error
 import pytest
@@ -18,8 +19,10 @@ from caldav_blade_mcp.client import (
     _classify_error,
     _extract_event,
     _is_all_day,
+    _overlaps_window,
     _parse_dt,
     _scrub_credentials,
+    local_day_window,
 )
 from caldav_blade_mcp.models import ProviderConfig
 from tests.conftest import make_calendar_obj, make_event_obj, make_searchable_calendar, make_vevent
@@ -112,6 +115,33 @@ class TestEventExtraction:
         assert result["recurrence_rule"] is None
 
 
+class TestLocalDayWindows:
+    def test_local_day_window_utc_plus_10(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CALDAV_LOCAL_TZ", "Australia/Sydney")
+
+        start, end = local_day_window(datetime(2026, 7, 16, 22, 30, tzinfo=ZoneInfo("Australia/Sydney")))
+
+        assert start == datetime(2026, 7, 16, tzinfo=ZoneInfo("Australia/Sydney"))
+        assert end == datetime(2026, 7, 17, tzinfo=ZoneInfo("Australia/Sydney"))
+        assert start != datetime(2026, 7, 16, tzinfo=UTC)
+
+    def test_local_day_window_invalid_tz_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CALDAV_LOCAL_TZ", "Not/AZone")
+
+        with pytest.raises(CalDAVError, match="Invalid CALDAV_LOCAL_TZ"):
+            local_day_window()
+
+    def test_overlaps_window(self) -> None:
+        start = datetime(2026, 7, 16, tzinfo=ZoneInfo("Australia/Sydney"))
+        end = start + timedelta(days=1)
+
+        assert _overlaps_window({"start": "2026-07-16", "end": None}, start, end)
+        assert _overlaps_window({"start": "2026-07-16", "end": "2026-07-16"}, start, end)
+        assert not _overlaps_window({"start": "2026-07-15", "end": "2026-07-16"}, start, end)
+        assert _overlaps_window({"start": "2026-07-15T18:00:00", "end": None}, start, end)
+        assert _overlaps_window({"start": None, "end": None}, start, end)
+
+
 class TestCalDAVClient:
     @patch("caldav_blade_mcp.client.DAVClient")
     def test_list_calendars(self, mock_dav_cls: MagicMock) -> None:
@@ -164,6 +194,77 @@ class TestCalDAVClient:
         assert len(result) == 1
         assert result[0]["uid"] == "ev-1"
         assert result[0]["title"] == "Standup"
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_get_today_queries_local_window(self, mock_dav_cls: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CALDAV_LOCAL_TZ", "Australia/Sydney")
+        cal = make_calendar_obj("Work", "work-id")
+        cal.search.return_value = []
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.get_today()
+
+        start = cal.search.call_args.kwargs["start"]
+        end = cal.search.call_args.kwargs["end"]
+        assert start.hour == 0
+        assert start.utcoffset() == timedelta(hours=10)
+        assert end - start == timedelta(days=1)
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_get_today_all_day_boundary(self, mock_dav_cls: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CALDAV_LOCAL_TZ", "Australia/Sydney")
+        today_start, _ = local_day_window()
+        tomorrow_start = today_start + timedelta(days=1)
+        tonight = today_start.replace(hour=23)
+        cal = make_calendar_obj("Work", "work-id")
+        cal.search.return_value = [
+            make_event_obj(
+                make_vevent(
+                    uid="today-all-day",
+                    summary="Today all day",
+                    dtstart=today_start,
+                    dtend=tomorrow_start,
+                    all_day=True,
+                )
+            ),
+            make_event_obj(
+                make_vevent(
+                    uid="tomorrow-all-day",
+                    summary="Tomorrow all day",
+                    dtstart=tomorrow_start,
+                    dtend=tomorrow_start + timedelta(days=1),
+                    all_day=True,
+                )
+            ),
+            make_event_obj(
+                make_vevent(
+                    uid="tonight",
+                    summary="Tonight",
+                    dtstart=tonight,
+                    dtend=tonight + timedelta(hours=1),
+                )
+            ),
+        ]
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        result = client.get_today()
+
+        assert [event["uid"] for event in result["Work"]] == ["today-all-day", "tonight"]
+
+    @patch("caldav_blade_mcp.client.DAVClient")
+    def test_get_week_local_window(self, mock_dav_cls: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CALDAV_LOCAL_TZ", "Australia/Sydney")
+        cal = make_calendar_obj("Work", "work-id")
+        cal.search.return_value = []
+        client = _client_with_calendars(mock_dav_cls, [cal])
+
+        client.get_week(start_monday=False)
+
+        start = cal.search.call_args.kwargs["start"]
+        end = cal.search.call_args.kwargs["end"]
+        assert start.hour == 0
+        assert start.utcoffset() == timedelta(hours=10)
+        assert end - start == timedelta(days=7)
 
     @patch("caldav_blade_mcp.client.DAVClient")
     def test_get_events_batch(self, mock_dav_cls: MagicMock) -> None:

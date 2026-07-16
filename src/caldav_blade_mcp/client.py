@@ -10,8 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import caldav
 import caldav.lib.error
@@ -91,6 +92,30 @@ def _scrub_credentials(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Event extraction
 # ---------------------------------------------------------------------------
+
+
+def _local_tz() -> tzinfo:
+    """Resolve the configured local timezone."""
+    name = os.environ.get("CALDAV_LOCAL_TZ", "").strip()
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise CalDAVError(f"Invalid CALDAV_LOCAL_TZ {name!r}: {exc}") from exc
+    local_tz = datetime.now().astimezone().tzinfo
+    if local_tz is None:
+        raise CalDAVError("Unable to resolve the system local timezone")
+    return local_tz
+
+
+def local_day_window(now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Return [00:00, 24:00) of today in the configured local timezone."""
+    if now is None:
+        now = datetime.now(tz=_local_tz())
+    else:
+        now = now.astimezone(_local_tz())
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
 
 
 def _serialize_dt(dt: date | datetime | None) -> str | None:
@@ -175,6 +200,41 @@ def _extract_event(vevent: Any) -> dict[str, Any]:
         "alarm_minutes": alarm_minutes,
         "sequence": int(str(vevent.get("SEQUENCE", 0))) if vevent.get("SEQUENCE") else 0,
     }
+
+
+def _overlaps_window(ev: dict[str, Any], start: datetime, end: datetime) -> bool:
+    """Return whether an event overlaps [start, end) using RFC 5545 semantics."""
+    raw_start = ev.get("start")
+    if raw_start is None:
+        return True
+
+    event_start = _parse_dt(raw_start)
+    raw_end = ev.get("end")
+
+    if isinstance(event_start, date) and not isinstance(event_start, datetime):
+        event_end = _parse_dt(raw_end) if raw_end is not None else None
+        if isinstance(event_end, datetime):
+            event_end = event_end.date()
+        if event_end is None or event_end == event_start:
+            event_end = event_start + timedelta(days=1)
+        assert isinstance(event_end, date) and not isinstance(event_end, datetime)
+        local_tz = start.tzinfo or UTC
+        window_event_start = datetime.combine(event_start, time.min, tzinfo=local_tz)
+        window_event_end = datetime.combine(event_end, time.min, tzinfo=local_tz)
+        return window_event_start < end and window_event_end > start
+
+    assert isinstance(event_start, datetime)
+    if event_start.tzinfo is None:
+        event_start = event_start.replace(tzinfo=UTC)
+    event_end = _parse_dt(raw_end) if raw_end is not None else None
+    if isinstance(event_end, date) and not isinstance(event_end, datetime):
+        event_end = datetime.combine(event_end, time.min, tzinfo=UTC)
+    if isinstance(event_end, datetime) and event_end.tzinfo is None:
+        event_end = event_end.replace(tzinfo=UTC)
+    if event_end is None or event_end == event_start:
+        return start <= event_start < end
+    assert isinstance(event_end, datetime)
+    return event_start < end and event_end > start
 
 
 # ---------------------------------------------------------------------------
@@ -449,14 +509,13 @@ class CalDAVClient:
 
     def get_today(self) -> dict[str, list[dict[str, Any]]]:
         """Get today's events across all calendars, grouped by calendar."""
-        now = datetime.now(tz=UTC)
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        today_end = today_start + timedelta(days=1)
+        today_start, today_end = local_day_window()
         result: dict[str, list[dict[str, Any]]] = {}
         for _, cal in self._all_calendars():
             name = str(cal.name) if cal.name else str(cal.id)
             try:
                 events = self._events_from_calendar(cal, today_start, today_end)
+                events = [event for event in events if _overlaps_window(event, today_start, today_end)]
                 if events:
                     result[name] = events
             except Exception as exc:
@@ -465,7 +524,7 @@ class CalDAVClient:
 
     def get_week(self, start_monday: bool = True) -> dict[str, list[dict[str, Any]]]:
         """Get this week's events across all calendars, grouped by calendar."""
-        now = datetime.now(tz=UTC)
+        now = datetime.now(tz=_local_tz())
         if start_monday:
             days_since_monday = now.weekday()
             week_start = (now - timedelta(days=days_since_monday)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -477,6 +536,7 @@ class CalDAVClient:
             name = str(cal.name) if cal.name else str(cal.id)
             try:
                 events = self._events_from_calendar(cal, week_start, week_end)
+                events = [event for event in events if _overlaps_window(event, week_start, week_end)]
                 if events:
                     result[name] = events
             except Exception as exc:

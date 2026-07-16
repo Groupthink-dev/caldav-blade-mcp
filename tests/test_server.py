@@ -131,6 +131,16 @@ class TestReadTools:
         assert "no events" in result
         assert "_meta:" in result
 
+    async def test_cal_today_meta_states_window(self, mock_client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CALDAV_LOCAL_TZ", "Australia/Sydney")
+        mock_client.get_today.return_value = {}
+
+        result = await cal_today()
+
+        assert "local_window=" in result
+        assert "+10:00.." in result
+        assert result.count("T00:00:00+10:00") == 2
+
     async def test_cal_week(self, mock_client: MagicMock) -> None:
         mock_client.get_week.return_value = {
             "Work": [
